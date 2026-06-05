@@ -1,0 +1,704 @@
+"""Run PolarAnything author checkpoint on the twostagenet test split."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import sys
+from pathlib import Path
+
+import imageio.v3 as iio
+import matplotlib
+import numpy as np
+import torch
+from diffusers import ControlNetModel, StableDiffusionControlNetPipeline, UNet2DConditionModel
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
+from transformers import PretrainedConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from model.PolarControlnet import PolarControl  # noqa: E402
+from model.utils import load_params, remove_module_prefix  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+METRIC_NAMES = (
+    "dolp_mae",
+    "dolp_rmse",
+    "cos_mae",
+    "sin_mae",
+    "cos_sin_vector_error",
+    "weighted_aolp_error_deg",
+    "high_dolp_aolp_error_deg",
+)
+
+
+class PolarControlTest(ControlNetModel):
+    """Author inference wrapper from PolarAnything-main/infer.py."""
+
+    def __init__(self, unet: UNet2DConditionModel) -> None:
+        super().__init__(cross_attention_dim=768)
+        self.controlnet = PolarControl(PretrainedConfig())
+        load_params(self.controlnet, unet)
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
+        conditioning_scale: float = 1.0,
+        class_labels: torch.Tensor | None = None,
+        timestep_cond: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cross_attention_kwargs: dict | None = None,
+        return_dict: bool = True,
+        guess_mode: bool | None = None,
+    ):
+        timestep = timestep.reshape(1)
+        out_down, out_mid = self.controlnet(
+            out_vae_noise=sample,
+            noise_step=timestep,
+            out_encoder=encoder_hidden_states,
+            condition=controlnet_cond,
+        )
+        if return_dict:
+            return {"down_block_res_samples": out_down, "mid_block_res_sample": out_mid}
+        return out_down, out_mid
+
+
+class PATestSplitDataset(Dataset):
+    """Load S0/RGB inputs and GT polarization in [DoLP, cos2, sin2] order."""
+
+    def __init__(
+        self,
+        root_dir: str | Path | None,
+        rgb_dir: str | Path | None,
+        gt_dir: str | Path | None,
+        image_size: int | None,
+    ) -> None:
+        self.root_dir = Path(root_dir) if root_dir is not None else None
+        self.rgb_dir = Path(rgb_dir) if rgb_dir is not None else self._resolve_rgb_dir()
+        self.gt_dir = Path(gt_dir) if gt_dir is not None else self._resolve_gt_dir()
+        self.image_size = image_size
+
+        if image_size is not None:
+            if image_size <= 0:
+                raise ValueError("image_size must be positive or None.")
+            if image_size % 8 != 0:
+                raise ValueError("image_size must be divisible by 8 for Stable Diffusion.")
+
+        self.samples = self._collect_samples()
+        if not self.samples:
+            raise RuntimeError(f"No matched samples found under {self.rgb_dir} and {self.gt_dir}.")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        rgb_path, gt_path, stem = self.samples[index]
+        rgb = self._read_rgb(rgb_path)
+        gt = self._read_gt(gt_path)
+
+        if self.image_size is not None:
+            rgb = self._resize_rgb(rgb, self.image_size)
+            gt = self._resize_polar(gt, self.image_size)
+        else:
+            rgb, gt = self._resize_to_multiple_of_8(rgb, gt)
+
+        return {
+            "rgb": rgb,
+            "polar_gt": gt,
+            "name": stem,
+        }
+
+    def _resolve_rgb_dir(self) -> Path:
+        if self.root_dir is None:
+            raise ValueError("Either root_dir or rgb_dir must be provided.")
+        return self._resolve_subdir(self.root_dir, ("S0", "s0", "RGB", "rgb"))
+
+    def _resolve_gt_dir(self) -> Path:
+        if self.root_dir is None:
+            raise ValueError("Either root_dir or gt_dir must be provided.")
+        return self._resolve_subdir(self.root_dir, ("Polarization_Encoding",))
+
+    @staticmethod
+    def _resolve_subdir(root_dir: Path, candidates: tuple[str, ...]) -> Path:
+        for candidate in candidates:
+            direct = root_dir / candidate
+            if direct.is_dir():
+                return direct
+        lower_candidates = {candidate.lower() for candidate in candidates}
+        if root_dir.is_dir():
+            for child in root_dir.iterdir():
+                if child.is_dir() and child.name.lower() in lower_candidates:
+                    return child
+        raise FileNotFoundError(f"Could not find any of {candidates} under {root_dir}.")
+
+    def _collect_samples(self) -> list[tuple[Path, Path, str]]:
+        rgb_files = self._index_images_by_stem(self.rgb_dir)
+        gt_files = self._index_images_by_stem(self.gt_dir)
+        stems = sorted(set(rgb_files) & set(gt_files))
+        return [(rgb_files[stem], gt_files[stem], stem) for stem in stems]
+
+    @staticmethod
+    def _index_images_by_stem(directory: Path) -> dict[str, Path]:
+        files: dict[str, Path] = {}
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                files.setdefault(path.stem, path)
+        return files
+
+    @staticmethod
+    def _read_rgb(path: Path) -> torch.Tensor:
+        image = Image.open(path).convert("RGB")
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        array = array * 2.0 - 1.0
+        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+    @classmethod
+    def _read_gt(cls, path: Path) -> torch.Tensor:
+        encoded = iio.imread(path)
+        if encoded.ndim == 2 or encoded.shape[-1] < 3:
+            raise ValueError(f"Expected 3-channel Polarization_Encoding image: {path}")
+        encoded_float = cls._to_unit_range(encoded[..., :3])
+        dolp = encoded_float[..., 0]
+        cos2 = encoded_float[..., 1] * 2.0 - 1.0
+        sin2 = encoded_float[..., 2] * 2.0 - 1.0
+        polar = np.stack((dolp, cos2, sin2), axis=0).astype(np.float32)
+        return normalize_polar_tensor(torch.from_numpy(polar))
+
+    @staticmethod
+    def _to_unit_range(array: np.ndarray) -> np.ndarray:
+        if array.dtype == np.uint16:
+            return array.astype(np.float32) / 65535.0
+        if array.dtype == np.uint8:
+            return array.astype(np.float32) / 255.0
+
+        array_float = array.astype(np.float32)
+        finite = array_float[np.isfinite(array_float)]
+        if finite.size == 0:
+            return np.zeros_like(array_float, dtype=np.float32)
+        min_value = float(finite.min())
+        max_value = float(finite.max())
+        if min_value >= 0.0 and max_value <= 1.0:
+            return array_float
+        if min_value >= 0.0 and max_value <= 255.0:
+            return array_float / 255.0
+        if min_value >= 0.0 and max_value <= 65535.0:
+            return array_float / 65535.0
+        return np.clip(array_float, 0.0, 1.0)
+
+    @staticmethod
+    def _resize_rgb(rgb: torch.Tensor, image_size: int) -> torch.Tensor:
+        array = rgb.permute(1, 2, 0).numpy()
+        array = ((array + 1.0) * 0.5 * 255.0).clip(0.0, 255.0).astype(np.uint8)
+        image = Image.fromarray(array, mode="RGB")
+        image = image.resize((image_size, image_size), Image.BILINEAR)
+        resized = np.asarray(image, dtype=np.float32) / 255.0
+        resized = resized * 2.0 - 1.0
+        return torch.from_numpy(resized).permute(2, 0, 1).contiguous()
+
+    @staticmethod
+    def _resize_polar(polar: torch.Tensor, image_size: int) -> torch.Tensor:
+        channels = []
+        for channel in polar:
+            image = Image.fromarray(channel.numpy().astype(np.float32), mode="F")
+            image = image.resize((image_size, image_size), Image.BILINEAR)
+            channels.append(np.asarray(image, dtype=np.float32))
+        resized = torch.from_numpy(np.stack(channels, axis=0)).contiguous()
+        return normalize_polar_tensor(resized)
+
+    @classmethod
+    def _resize_to_multiple_of_8(
+        cls,
+        rgb: torch.Tensor,
+        gt: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        height, width = rgb.shape[-2:]
+        target_height = (height // 8) * 8
+        target_width = (width // 8) * 8
+        if target_height <= 0 or target_width <= 0:
+            raise ValueError(f"Image is too small for Stable Diffusion: {height}x{width}")
+        if target_height == height and target_width == width:
+            return rgb, gt
+
+        rgb = cls._resize_rgb_hw(rgb, target_height, target_width)
+        gt = cls._resize_polar_hw(gt, target_height, target_width)
+        return rgb, gt
+
+    @staticmethod
+    def _resize_rgb_hw(rgb: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        array = rgb.permute(1, 2, 0).numpy()
+        array = ((array + 1.0) * 0.5 * 255.0).clip(0.0, 255.0).astype(np.uint8)
+        image = Image.fromarray(array, mode="RGB")
+        image = image.resize((width, height), Image.BILINEAR)
+        resized = np.asarray(image, dtype=np.float32) / 255.0
+        resized = resized * 2.0 - 1.0
+        return torch.from_numpy(resized).permute(2, 0, 1).contiguous()
+
+    @staticmethod
+    def _resize_polar_hw(polar: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        channels = []
+        for channel in polar:
+            image = Image.fromarray(channel.numpy().astype(np.float32), mode="F")
+            image = image.resize((width, height), Image.BILINEAR)
+            channels.append(np.asarray(image, dtype=np.float32))
+        resized = torch.from_numpy(np.stack(channels, axis=0)).contiguous()
+        return normalize_polar_tensor(resized)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Infer PolarAnything baseline on the twostagenet test split."
+    )
+    parser.add_argument("--root_dir", type=str, default=None)
+    parser.add_argument("--rgb_dir", "--s0_dir", dest="rgb_dir", type=str, default=None)
+    parser.add_argument("--gt_dir", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default="runwayml/stable-diffusion-v1-5",
+    )
+    parser.add_argument("--output_dir", type=str, default="./pa_baseline_test_outputs")
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--vis_every", type=int, default=50)
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--hf_cache_dir", type=str, default=None)
+    parser.add_argument("--save_pred_png", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_arg)
+
+
+def build_dataloader(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, int]:
+    dataset = PATestSplitDataset(
+        root_dir=args.root_dir,
+        rgb_dir=args.rgb_dir,
+        gt_dir=args.gt_dir,
+        image_size=args.image_size,
+    )
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("max_samples must be positive or None.")
+        dataset = Subset(dataset, range(min(args.max_samples, len(dataset))))
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    return dataloader, len(dataset)
+
+
+def build_pipeline(args: argparse.Namespace, device: torch.device) -> StableDiffusionControlNetPipeline:
+    checkpoint = resolve_pretrained_model_path(
+        args.pretrained_model_name_or_path,
+        args.hf_cache_dir,
+    )
+    from_pretrained_kwargs = {}
+    if args.hf_cache_dir and not Path(checkpoint).expanduser().exists():
+        from_pretrained_kwargs["cache_dir"] = args.hf_cache_dir
+
+    unet = UNet2DConditionModel.from_pretrained(
+        checkpoint,
+        subfolder="unet",
+        **from_pretrained_kwargs,
+    )
+    controlnet = PolarControlTest(unet)
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        checkpoint,
+        unet=unet,
+        controlnet=controlnet,
+        safety_checker=None,
+        **from_pretrained_kwargs,
+    )
+    pipeline.unet.requires_grad_(False)
+    pipeline.controlnet.requires_grad_(False)
+
+    checkpoint_data = torch.load(args.checkpoint, map_location=device)
+    pipeline.unet.load_state_dict(remove_module_prefix(checkpoint_data["unet_state_dict"]))
+    pipeline.controlnet.controlnet.load_state_dict(
+        remove_module_prefix(checkpoint_data["controlnet_state_dict"])
+    )
+    pipeline = pipeline.to(device)
+    pipeline.set_progress_bar_config(disable=True)
+    return pipeline
+
+
+def resolve_pretrained_model_path(
+    model_name_or_path: str,
+    hf_cache_dir: str | None,
+) -> str:
+    model_path = Path(model_name_or_path).expanduser()
+    if model_path.exists():
+        return str(model_path)
+
+    snapshot = find_local_hf_snapshot(model_name_or_path, hf_cache_dir)
+    if snapshot is not None:
+        print(f"Using local Hugging Face snapshot: {snapshot}", flush=True)
+        return str(snapshot)
+    return model_name_or_path
+
+
+def find_local_hf_snapshot(repo_id: str, hf_cache_dir: str | None) -> Path | None:
+    if "/" not in repo_id:
+        return None
+
+    repo_cache_name = "models--" + repo_id.replace("/", "--")
+    candidates: list[Path] = []
+    if hf_cache_dir:
+        cache_dir = Path(hf_cache_dir).expanduser()
+        candidates.append(cache_dir / "hub" / repo_cache_name)
+        candidates.append(cache_dir / repo_cache_name)
+    hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hf_hub_cache:
+        candidates.append(Path(hf_hub_cache).expanduser() / repo_cache_name)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidates.append(Path(hf_home).expanduser() / "hub" / repo_cache_name)
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub" / repo_cache_name)
+
+    for repo_cache_dir in candidates:
+        snapshot_dir = choose_complete_snapshot(repo_cache_dir / "snapshots")
+        if snapshot_dir is not None:
+            return snapshot_dir
+    return None
+
+
+def choose_complete_snapshot(snapshots_dir: Path) -> Path | None:
+    if not snapshots_dir.is_dir():
+        return None
+    snapshots = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for snapshot in snapshots:
+        if is_complete_sd_snapshot(snapshot):
+            return snapshot
+    return None
+
+
+def is_complete_sd_snapshot(snapshot: Path) -> bool:
+    required_files = (
+        "unet/config.json",
+        "vae/config.json",
+        "text_encoder/config.json",
+        "tokenizer/tokenizer_config.json",
+        "scheduler/scheduler_config.json",
+    )
+    return all((snapshot / path).is_file() for path in required_files)
+
+
+def make_generator(device: torch.device, seed: int) -> torch.Generator:
+    if device.type == "cuda":
+        generator = torch.Generator(device="cuda")
+    else:
+        generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def infer_one(
+    pipeline: StableDiffusionControlNetPipeline,
+    rgb: torch.Tensor,
+    device: torch.device,
+    generator: torch.Generator,
+    num_inference_steps: int,
+) -> torch.Tensor:
+    height, width = rgb.shape[-2:]
+    result = pipeline(
+        "denoised polarized images",
+        rgb.unsqueeze(0).to(device),
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        output_type="np",
+        generator=generator,
+    )
+    image = result.images[0].astype(np.float32)
+    pred = pipeline_output_to_polar(image)
+    return pred.cpu()
+
+
+def pipeline_output_to_polar(image: np.ndarray) -> torch.Tensor:
+    image = np.clip(image, 0.0, 1.0).astype(np.float32)
+    if image.ndim != 3 or image.shape[-1] < 3:
+        raise ValueError(f"Expected pipeline RGB output with at least 3 channels, got {image.shape}.")
+    dolp = image[..., 0]
+    cos2 = image[..., 1] * 2.0 - 1.0
+    sin2 = image[..., 2] * 2.0 - 1.0
+    polar = torch.from_numpy(np.stack((dolp, cos2, sin2), axis=0).astype(np.float32))
+    return normalize_polar_tensor(polar)
+
+
+def normalize_polar_tensor(polar: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    dolp = polar[0:1].clamp(0.0, 1.0)
+    cos_sin = polar[1:3]
+    norm = torch.sqrt((cos_sin * cos_sin).sum(dim=0, keepdim=True) + eps)
+    cos_sin = cos_sin / norm
+    return torch.cat((dolp, cos_sin), dim=0).contiguous()
+
+
+def resize_prediction_to_gt(pred: torch.Tensor, gt: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    if pred.shape[-2:] == gt.shape[-2:]:
+        return pred, False
+    resized = torch.nn.functional.interpolate(
+        pred.unsqueeze(0),
+        size=gt.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    return normalize_polar_tensor(resized), True
+
+
+def save_pred_png(path: Path, pred: torch.Tensor) -> None:
+    dolp = pred[0].clamp(0.0, 1.0)
+    cos2 = ((pred[1].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    sin2 = ((pred[2].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    encoded = torch.stack((dolp, cos2, sin2), dim=-1).numpy()
+    iio.imwrite(path, (encoded * 65535.0).round().astype(np.uint16))
+
+
+def compute_metric_dict(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
+    pred = pred.detach().float().cpu()
+    gt = gt.detach().float().cpu()
+    dolp_error = (pred[0] - gt[0]).abs()
+    cos_error = (pred[1] - gt[1]).abs()
+    sin_error = (pred[2] - gt[2]).abs()
+    vector_error = torch.sqrt((pred[1] - gt[1]) ** 2 + (pred[2] - gt[2]) ** 2)
+
+    dot = pred[1] * gt[1] + pred[2] * gt[2]
+    err_2aolp = torch.arccos(dot.clamp(-1.0, 1.0))
+    err_aolp_deg = err_2aolp * 0.5 * (180.0 / math.pi)
+    reliability = torch.clamp((gt[0] - 0.03) / (0.15 - 0.03), 0.0, 1.0)
+    high_mask = gt[0] > 0.15
+
+    return {
+        "dolp_mae": float(dolp_error.mean()),
+        "dolp_rmse": float(torch.sqrt(torch.mean((pred[0] - gt[0]) ** 2))),
+        "cos_mae": float(cos_error.mean()),
+        "sin_mae": float(sin_error.mean()),
+        "cos_sin_vector_error": float(vector_error.mean()),
+        "weighted_aolp_error_deg": weighted_mean(err_aolp_deg, reliability),
+        "high_dolp_aolp_error_deg": masked_mean(err_aolp_deg, high_mask),
+    }
+
+
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> float:
+    weight_sum = weights.sum()
+    if float(weight_sum) <= 0.0:
+        return float("nan")
+    return float((values * weights).sum() / weight_sum)
+
+
+def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+    if int(mask.sum()) == 0:
+        return float("nan")
+    return float(values[mask].mean())
+
+
+def tensor_to_rgb_image(rgb: torch.Tensor) -> np.ndarray:
+    image = rgb.detach().cpu().permute(1, 2, 0).numpy()
+    return np.clip((image + 1.0) * 0.5, 0.0, 1.0)
+
+
+def to_display_map(tensor: torch.Tensor, value_range: tuple[float, float]) -> np.ndarray:
+    array = tensor.detach().cpu().numpy()
+    min_value, max_value = value_range
+    return np.clip((array - min_value) / (max_value - min_value), 0.0, 1.0)
+
+
+def save_visualization(
+    rgb: torch.Tensor,
+    gt: torch.Tensor,
+    pred: torch.Tensor,
+    path: Path,
+) -> None:
+    rgb_image = tensor_to_rgb_image(rgb)
+    dolp_error = (pred[0] - gt[0]).abs()
+    vector_error = torch.sqrt((pred[1] - gt[1]) ** 2 + (pred[2] - gt[2]) ** 2)
+    reliability = torch.clamp((gt[0] - 0.03) / (0.15 - 0.03), 0.0, 1.0)
+    high_mask = (gt[0] > 0.15).float()
+
+    panels = [
+        ("RGB", rgb_image, None),
+        ("GT DoLP", gt[0].numpy(), (0.0, 1.0)),
+        ("PA pred DoLP", pred[0].numpy(), (0.0, 1.0)),
+        ("DoLP error", dolp_error.numpy(), (0.0, 1.0)),
+        ("GT cos2", to_display_map(gt[1], (-1.0, 1.0)), (0.0, 1.0)),
+        ("PA pred cos2", to_display_map(pred[1], (-1.0, 1.0)), (0.0, 1.0)),
+        ("GT sin2", to_display_map(gt[2], (-1.0, 1.0)), (0.0, 1.0)),
+        ("PA pred sin2", to_display_map(pred[2], (-1.0, 1.0)), (0.0, 1.0)),
+        ("Vector error", vector_error.numpy(), (0.0, 2.0)),
+        ("Reliability", reliability.numpy(), (0.0, 1.0)),
+        ("High-DoLP mask", high_mask.numpy(), (0.0, 1.0)),
+    ]
+
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    for axis, (title, image, value_range) in zip(axes.flat, panels):
+        if image.ndim == 3:
+            axis.imshow(image)
+        else:
+            vmin, vmax = value_range if value_range is not None else (None, None)
+            axis.imshow(image, cmap="gray", vmin=vmin, vmax=vmax)
+        axis.set_title(title)
+        axis.axis("off")
+    for axis in list(axes.flat)[len(panels):]:
+        axis.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def write_metrics_csv(metrics_path: Path, rows: list[dict[str, float | str]]) -> None:
+    fieldnames = ["name"]
+    fieldnames.extend(METRIC_NAMES)
+    with metrics_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def summarize_rows(rows: list[dict[str, float | str]]) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    for metric_name in METRIC_NAMES:
+        values = np.array([float(row[metric_name]) for row in rows], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        summary[metric_name] = float(finite.mean()) if finite.size else float("nan")
+    return summary
+
+
+def write_summary(
+    summary_path: Path,
+    args: argparse.Namespace,
+    sample_count: int,
+    summary: dict[str, float],
+    resized_output_count: int,
+) -> None:
+    lines = [
+        "PolarAnything author baseline test summary",
+        f"checkpoint: {args.checkpoint}",
+        f"test_root: {args.root_dir}",
+        f"rgb_dir: {args.rgb_dir}",
+        f"gt_dir: {args.gt_dir}",
+        f"samples: {sample_count}",
+        f"image_size: {args.image_size}",
+        f"num_inference_steps: {args.num_inference_steps}",
+        f"seed: {args.seed}",
+        f"resized_outputs_to_gt: {resized_output_count}",
+        "",
+        "Mean metrics:",
+    ]
+    for key in sorted(summary):
+        lines.append(f"{key}: {format_float(summary[key])}")
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def format_float(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return f"{value:.6f}"
+
+
+def run(args: argparse.Namespace) -> None:
+    if args.num_inference_steps <= 0:
+        raise ValueError("num_inference_steps must be positive.")
+    if args.hf_cache_dir:
+        os.environ.setdefault("HF_HOME", args.hf_cache_dir)
+        os.environ.setdefault("HF_HUB_CACHE", str(Path(args.hf_cache_dir) / "hub"))
+
+    torch.manual_seed(args.seed)
+    device = resolve_device(args.device)
+    generator = make_generator(device, args.seed)
+
+    output_dir = Path(args.output_dir)
+    pred_npy_dir = output_dir / "pred_npy"
+    pred_png_dir = output_dir / "pred_png"
+    vis_dir = output_dir / "vis"
+    pred_npy_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_pred_png:
+        pred_png_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    dataloader, dataset_size = build_dataloader(args, device)
+    pipeline = build_pipeline(args, device)
+
+    rows: list[dict[str, float | str]] = []
+    processed = 0
+    resized_output_count = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            names = batch["name"]
+            rgb_batch = batch["rgb"]
+            gt_batch = batch["polar_gt"]
+
+            for offset, name in enumerate(names):
+                sample_index = processed + offset
+                rgb = rgb_batch[offset].cpu()
+                gt = gt_batch[offset].cpu()
+                pred = infer_one(
+                    pipeline=pipeline,
+                    rgb=rgb,
+                    device=device,
+                    generator=generator,
+                    num_inference_steps=args.num_inference_steps,
+                )
+                pred, resized = resize_prediction_to_gt(pred, gt)
+                if resized:
+                    resized_output_count += 1
+
+                np.save(pred_npy_dir / f"{name}.npy", pred.numpy().astype(np.float32))
+                if args.save_pred_png:
+                    save_pred_png(pred_png_dir / f"{name}.png", pred)
+
+                row: dict[str, float | str] = {"name": name}
+                row.update(compute_metric_dict(pred, gt))
+                rows.append(row)
+
+                if args.vis_every > 0 and sample_index % args.vis_every == 0:
+                    save_visualization(rgb, gt, pred, vis_dir / f"{name}.png")
+
+            processed += len(names)
+            print(f"processed {processed}/{dataset_size}", flush=True)
+
+    write_metrics_csv(output_dir / "metrics.csv", rows)
+    summary = summarize_rows(rows)
+    write_summary(
+        summary_path=output_dir / "summary.txt",
+        args=args,
+        sample_count=len(rows),
+        summary=summary,
+        resized_output_count=resized_output_count,
+    )
+    print(f"Done. Wrote outputs to {output_dir}", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    run(args)
+
+
+if __name__ == "__main__":
+    main()
