@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+import cv2
 import imageio.v3 as iio
 import matplotlib
 import numpy as np
@@ -476,8 +477,12 @@ def save_pred_png(path: Path, pred: torch.Tensor) -> None:
     dolp = pred[0].clamp(0.0, 1.0)
     cos2 = ((pred[1].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
     sin2 = ((pred[2].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
-    encoded = torch.stack((dolp, cos2, sin2), dim=-1).numpy()
-    iio.imwrite(path, (encoded * 65535.0).round().astype(np.uint16))
+    encoded_rgb = torch.stack((dolp, cos2, sin2), dim=-1).numpy()
+    encoded_uint16 = (encoded_rgb * 65535.0).round().astype(np.uint16)
+    encoded_bgr = cv2.cvtColor(encoded_uint16, cv2.COLOR_RGB2BGR)
+    ok = cv2.imwrite(str(path), encoded_bgr)
+    if not ok:
+        raise RuntimeError(f"Failed to write prediction PNG: {path}")
 
 
 def compute_metric_dict(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
