@@ -93,17 +93,25 @@ class PATestSplitDataset(Dataset):
         rgb_dir: str | Path | None,
         gt_dir: str | Path | None,
         image_size: int | None,
+        preprocess_mode: str = "aligned256",
+        normalize_mode: str = "fixed255",
     ) -> None:
         self.root_dir = Path(root_dir) if root_dir is not None else None
         self.rgb_dir = Path(rgb_dir) if rgb_dir is not None else self._resolve_rgb_dir()
         self.gt_dir = Path(gt_dir) if gt_dir is not None else self._resolve_gt_dir()
         self.image_size = image_size
+        self.preprocess_mode = preprocess_mode
+        self.normalize_mode = normalize_mode
 
         if image_size is not None:
             if image_size <= 0:
                 raise ValueError("image_size must be positive or None.")
             if image_size % 8 != 0:
                 raise ValueError("image_size must be divisible by 8 for Stable Diffusion.")
+        if preprocess_mode not in {"aligned256", "official"}:
+            raise ValueError(f"Unsupported preprocess_mode: {preprocess_mode}")
+        if normalize_mode not in {"fixed255", "image_max"}:
+            raise ValueError(f"Unsupported normalize_mode: {normalize_mode}")
 
         self.samples = self._collect_samples()
         if not self.samples:
@@ -114,14 +122,18 @@ class PATestSplitDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         rgb_path, gt_path, stem = self.samples[index]
-        rgb = self._read_rgb(rgb_path)
+        rgb, native_size, input_size = self._read_rgb_for_mode(rgb_path)
         gt = self._read_gt(gt_path)
 
-        if self.image_size is not None:
+        if self.preprocess_mode == "aligned256" and self.image_size is not None:
             rgb = self._resize_rgb(rgb, self.image_size)
             gt = self._resize_polar(gt, self.image_size)
-        else:
+            input_size = f"{self.image_size}x{self.image_size}"
+        elif self.preprocess_mode == "aligned256":
             rgb, gt = self._resize_to_multiple_of_8(rgb, gt)
+            input_size = f"{rgb.shape[-2]}x{rgb.shape[-1]}"
+        elif self.image_size is not None:
+            gt = self._resize_polar(gt, self.image_size)
 
         return {
             "rgb": rgb,
@@ -129,6 +141,8 @@ class PATestSplitDataset(Dataset):
             "name": stem,
             "rgb_path": str(rgb_path),
             "gt_path": str(gt_path),
+            "input_native_size": native_size,
+            "input_size": input_size,
         }
 
     def _resolve_rgb_dir(self) -> Path:
@@ -174,6 +188,22 @@ class PATestSplitDataset(Dataset):
         array = np.asarray(image, dtype=np.float32) / 255.0
         array = array * 2.0 - 1.0
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+    def _read_rgb_for_mode(self, path: Path) -> tuple[torch.Tensor, str, str]:
+        if self.preprocess_mode == "official":
+            rgb, native_size, input_size = official_preprocess_image_with_sizes(
+                path,
+                normalize_mode=self.normalize_mode,
+            )
+            return rgb, native_size, input_size
+
+        if self.normalize_mode == "image_max":
+            rgb = read_rgb_image_max(path)
+        else:
+            rgb = self._read_rgb(path)
+        height, width = rgb.shape[-2:]
+        size = f"{height}x{width}"
+        return rgb, size, size
 
     @classmethod
     def _read_gt(cls, path: Path) -> torch.Tensor:
@@ -282,6 +312,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output_dir", type=str, default="./pa_baseline_test_outputs")
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("aligned256", "official"),
+        default="aligned256",
+    )
+    parser.add_argument(
+        "--normalize_mode",
+        choices=("fixed255", "image_max"),
+        default=None,
+        help="Defaults to fixed255 for aligned256 and image_max for official.",
+    )
+    parser.add_argument("--resize_output_to_gt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -306,12 +348,24 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+def resolve_normalize_mode(preprocess_mode: str, normalize_mode: str | None) -> str:
+    if normalize_mode is not None:
+        return normalize_mode
+    if preprocess_mode == "official":
+        return "image_max"
+    return "fixed255"
+
+
 def build_dataloader(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, int]:
+    if args.preprocess_mode == "official" and args.batch_size != 1:
+        raise ValueError("official preprocess_mode keeps native sizes; please use --batch_size 1.")
     dataset = PATestSplitDataset(
         root_dir=args.root_dir,
         rgb_dir=args.rgb_dir,
         gt_dir=args.gt_dir,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        normalize_mode=args.resolved_normalize_mode,
     )
     if args.max_samples is not None:
         if args.max_samples <= 0:
@@ -508,24 +562,70 @@ def run_pipeline_raw(
     )
 
 
-def official_preprocess_image(image_path: str | Path) -> torch.Tensor:
+def read_rgb_image_max(image_path: str | Path) -> torch.Tensor:
+    image = Image.open(image_path).convert("RGB")
+    array = np.asarray(image, dtype=np.float32)
+    max_value = float(np.max(array))
+    if max_value <= 0.0:
+        raise ValueError(f"Input image has non-positive max value: {image_path}")
+    array = array / max_value
+    array = array * 2.0 - 1.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def official_preprocess_image_with_sizes(
+    image_path: str | Path,
+    normalize_mode: str = "image_max",
+) -> tuple[torch.Tensor, str, str]:
     image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise FileNotFoundError(f"Could not read official input image: {image_path}")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    height, width, _ = image.shape
-    height, width = (height // 8) * 8, (width // 8) * 8
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[-1] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    else:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    native_height, native_width = image.shape[:2]
+    height, width = (native_height // 8) * 8, (native_width // 8) * 8
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Official input image is too small: {image_path}")
     image = cv2.resize(image, (width, height))
-    max_value = float(np.max(image))
-    if max_value <= 0.0:
-        raise ValueError(f"Official input image has non-positive max value: {image_path}")
-    image = image.astype(np.float32) / max_value
+    image = image.astype(np.float32)
+    if normalize_mode == "image_max":
+        max_value = float(np.max(image))
+        if max_value <= 0.0:
+            raise ValueError(f"Official input image has non-positive max value: {image_path}")
+        image = image / max_value
+    elif normalize_mode == "fixed255":
+        image = image / 255.0
+    else:
+        raise ValueError(f"Unsupported normalize_mode: {normalize_mode}")
     tensor_image = torch.from_numpy(image).permute(2, 0, 1).float()
-    return tensor_image * 2.0 - 1.0
+    return tensor_image * 2.0 - 1.0, f"{native_height}x{native_width}", f"{height}x{width}"
 
 
-def current_preprocess_image(image_path: str | Path, image_size: int | None) -> torch.Tensor:
-    rgb = PATestSplitDataset._read_rgb(Path(image_path))
+def official_preprocess_image(image_path: str | Path) -> torch.Tensor:
+    tensor_image, _, _ = official_preprocess_image_with_sizes(image_path, normalize_mode="image_max")
+    return tensor_image
+
+
+def current_preprocess_image(
+    image_path: str | Path,
+    image_size: int | None,
+    preprocess_mode: str = "aligned256",
+    normalize_mode: str = "fixed255",
+) -> torch.Tensor:
+    if preprocess_mode == "official":
+        rgb, _, _ = official_preprocess_image_with_sizes(
+            image_path,
+            normalize_mode=normalize_mode,
+        )
+        return rgb
+    if normalize_mode == "image_max":
+        rgb = read_rgb_image_max(image_path)
+    else:
+        rgb = PATestSplitDataset._read_rgb(Path(image_path))
     if image_size is not None:
         return PATestSplitDataset._resize_rgb(rgb, image_size)
     height, width = rgb.shape[-2:]
@@ -590,6 +690,21 @@ def resize_prediction_to_gt(pred: torch.Tensor, gt: torch.Tensor) -> tuple[torch
         align_corners=False,
     ).squeeze(0)
     return normalize_polar_tensor(resized), True
+
+
+def resize_prediction_to_gt_if_requested(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    resize_output_to_gt: bool,
+) -> tuple[torch.Tensor, bool]:
+    if pred.shape[-2:] == gt.shape[-2:]:
+        return pred, False
+    if not resize_output_to_gt:
+        raise ValueError(
+            "Prediction and GT sizes differ. Use --resize_output_to_gt for metrics "
+            f"or align sizes manually. pred={tuple(pred.shape[-2:])}, gt={tuple(gt.shape[-2:])}"
+        )
+    return resize_prediction_to_gt(pred, gt)
 
 
 def save_pred_png(path: Path, pred: torch.Tensor) -> None:
@@ -777,6 +892,8 @@ def run_fairness_check(
                 rgb_dir=None,
                 gt_dir=args.gt_dir,
                 image_size=args.image_size,
+                preprocess_mode=args.preprocess_mode,
+                normalize_mode=args.resolved_normalize_mode,
             ).rgb_dir
         else:
             raise ValueError("fairness_check needs root_dir, rgb_dir, or official_input_folder.")
@@ -801,6 +918,8 @@ def run_fairness_check(
         f"checkpoint: {args.checkpoint}",
         f"pretrained_model_name_or_path: {args.pretrained_model_name_or_path}",
         f"official_input_folder: {input_dir}",
+        f"preprocess_mode: {args.preprocess_mode}",
+        f"normalize_mode: {args.resolved_normalize_mode}",
         f"num_inference_steps: {args.num_inference_steps}",
         f"seed: {args.seed}",
         "",
@@ -810,7 +929,12 @@ def run_fairness_check(
 
     for index, image_path in enumerate(image_files):
         sample_seed = args.seed + index
-        current_rgb = current_preprocess_image(image_path, args.image_size)
+        current_rgb = current_preprocess_image(
+            image_path,
+            args.image_size,
+            preprocess_mode=args.preprocess_mode,
+            normalize_mode=args.resolved_normalize_mode,
+        )
         official_rgb = official_preprocess_image(image_path)
 
         current_raw = run_pipeline_raw(
@@ -862,7 +986,7 @@ def run_fairness_check(
         [
             "",
             "Notes:",
-            "- current_shape uses this script's preprocessing, including --image_size when provided.",
+            "- current_shape uses this script's selected preprocessing mode.",
             "- official_shape uses PolarAnything infer.py preprocessing: cv2 BGR->RGB, floor to multiple of 8, divide by image max, then [-1,1].",
             "- Raw/final arrays are saved under the fairness-check output folder for inspection.",
         ]
@@ -889,6 +1013,8 @@ def write_summary(
     sample_count: int,
     summary: dict[str, float],
     resized_output_count: int,
+    input_native_sizes: set[str],
+    input_sizes: set[str],
 ) -> None:
     lines = [
         "PolarAnything author baseline test summary",
@@ -898,15 +1024,30 @@ def write_summary(
         f"gt_dir: {args.gt_dir}",
         f"samples: {sample_count}",
         f"image_size: {args.image_size}",
+        f"preprocess_mode: {args.preprocess_mode}",
+        f"normalize_mode: {args.resolved_normalize_mode}",
+        f"input_native_size: {format_size_set(input_native_sizes)}",
+        f"input_size: {format_size_set(input_sizes)}",
         f"num_inference_steps: {args.num_inference_steps}",
         f"seed: {args.seed}",
+        f"resize_output_to_gt: {args.resize_output_to_gt}",
         f"resized_outputs_to_gt: {resized_output_count}",
+        f"output_resized_to_gt_count: {resized_output_count}",
         "",
         "Mean metrics:",
     ]
     for key in sorted(summary):
         lines.append(f"{key}: {format_float(summary[key])}")
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def format_size_set(values: set[str]) -> str:
+    if not values:
+        return "unknown"
+    ordered = sorted(values)
+    if len(ordered) <= 8:
+        return ", ".join(ordered)
+    return ", ".join(ordered[:8]) + f", ... ({len(ordered)} unique)"
 
 
 def format_float(value: float) -> str:
@@ -918,6 +1059,10 @@ def format_float(value: float) -> str:
 def run(args: argparse.Namespace) -> None:
     if args.num_inference_steps <= 0:
         raise ValueError("num_inference_steps must be positive.")
+    args.resolved_normalize_mode = resolve_normalize_mode(
+        args.preprocess_mode,
+        args.normalize_mode,
+    )
     if args.hf_cache_dir:
         os.environ.setdefault("HF_HOME", args.hf_cache_dir)
         os.environ.setdefault("HF_HUB_CACHE", str(Path(args.hf_cache_dir) / "hub"))
@@ -947,11 +1092,15 @@ def run(args: argparse.Namespace) -> None:
     diagnosis_metrics = {name: [] for name in CHANNEL_ORDER_CANDIDATES}
     processed = 0
     resized_output_count = 0
+    input_native_sizes: set[str] = set()
+    input_sizes: set[str] = set()
     with torch.no_grad():
         for batch in dataloader:
             names = batch["name"]
             rgb_batch = batch["rgb"]
             gt_batch = batch["polar_gt"]
+            input_native_sizes.update(str(value) for value in batch["input_native_size"])
+            input_sizes.update(str(value) for value in batch["input_size"])
 
             for offset, name in enumerate(names):
                 sample_index = processed + offset
@@ -970,13 +1119,21 @@ def run(args: argparse.Namespace) -> None:
                 if args.diagnose_channel_order:
                     for candidate_name, order in CHANNEL_ORDER_CANDIDATES.items():
                         candidate_pred = interpret_raw_output(raw, order)
-                        candidate_pred, _ = resize_prediction_to_gt(candidate_pred, gt)
+                        candidate_pred, _ = resize_prediction_to_gt_if_requested(
+                            candidate_pred,
+                            gt,
+                            args.resize_output_to_gt,
+                        )
                         diagnosis_metrics[candidate_name].append(
                             compute_metric_dict(candidate_pred, gt)
                         )
 
                 pred = interpret_raw_output(raw, CHANNEL_ORDER_CANDIDATES["A_[DoLP,cos2,sin2]"])
-                pred, resized = resize_prediction_to_gt(pred, gt)
+                pred, resized = resize_prediction_to_gt_if_requested(
+                    pred,
+                    gt,
+                    args.resize_output_to_gt,
+                )
                 if resized:
                     resized_output_count += 1
 
@@ -1007,6 +1164,8 @@ def run(args: argparse.Namespace) -> None:
         sample_count=len(rows),
         summary=summary,
         resized_output_count=resized_output_count,
+        input_native_sizes=input_native_sizes,
+        input_sizes=input_sizes,
     )
     print(f"Done. Wrote outputs to {output_dir}", flush=True)
 
