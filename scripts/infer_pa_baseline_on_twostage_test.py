@@ -127,6 +127,8 @@ class PATestSplitDataset(Dataset):
             "rgb": rgb,
             "polar_gt": gt,
             "name": stem,
+            "rgb_path": str(rgb_path),
+            "gt_path": str(gt_path),
         }
 
     def _resolve_rgb_dir(self) -> Path:
@@ -291,6 +293,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_pred_png", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save_raw_outputs", action="store_true")
     parser.add_argument("--diagnose_channel_order", action="store_true")
+    parser.add_argument("--fairness_check", action="store_true")
+    parser.add_argument("--official_input_folder", type=str, default=None)
+    parser.add_argument("--official_results_folder", type=str, default=None)
+    parser.add_argument("--report_path", type=str, default="reports/pa_baseline_fairness_check_runtime.md")
     return parser.parse_args()
 
 
@@ -347,13 +353,46 @@ def build_pipeline(args: argparse.Namespace, device: torch.device) -> StableDiff
     pipeline.controlnet.requires_grad_(False)
 
     checkpoint_data = torch.load(args.checkpoint, map_location=device)
-    pipeline.unet.load_state_dict(remove_module_prefix(checkpoint_data["unet_state_dict"]))
-    pipeline.controlnet.controlnet.load_state_dict(
+    validate_checkpoint_keys(checkpoint_data, args.checkpoint)
+    unet_result = pipeline.unet.load_state_dict(
+        remove_module_prefix(checkpoint_data["unet_state_dict"])
+    )
+    controlnet_result = pipeline.controlnet.controlnet.load_state_dict(
         remove_module_prefix(checkpoint_data["controlnet_state_dict"])
     )
+    print_load_result("UNet", unet_result)
+    print_load_result("ControlNet", controlnet_result)
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     return pipeline
+
+
+def validate_checkpoint_keys(checkpoint_data: dict, checkpoint_path: str) -> None:
+    required_keys = ("unet_state_dict", "controlnet_state_dict")
+    missing_keys = [key for key in required_keys if key not in checkpoint_data]
+    if missing_keys:
+        raise KeyError(
+            f"Checkpoint {checkpoint_path} is missing required keys: {', '.join(missing_keys)}"
+        )
+    print(
+        "Loaded PA checkpoint keys: "
+        + ", ".join(sorted(str(key) for key in checkpoint_data.keys())),
+        flush=True,
+    )
+
+
+def print_load_result(name: str, result) -> None:
+    missing = list(getattr(result, "missing_keys", []))
+    unexpected = list(getattr(result, "unexpected_keys", []))
+    print(
+        f"{name} load_state_dict: missing_keys={len(missing)}, "
+        f"unexpected_keys={len(unexpected)}",
+        flush=True,
+    )
+    if missing:
+        print(f"{name} missing keys: {missing}", flush=True)
+    if unexpected:
+        print(f"{name} unexpected keys: {unexpected}", flush=True)
 
 
 def resolve_pretrained_model_path(
@@ -450,6 +489,51 @@ def infer_one(
     image = result.images[0].astype(np.float32)
     raw = pipeline_output_to_raw_chw(image)
     return raw.cpu()
+
+
+def run_pipeline_raw(
+    pipeline: StableDiffusionControlNetPipeline,
+    rgb: torch.Tensor,
+    device: torch.device,
+    seed: int,
+    num_inference_steps: int,
+) -> torch.Tensor:
+    generator = make_generator(device, seed)
+    return infer_one(
+        pipeline=pipeline,
+        rgb=rgb,
+        device=device,
+        generator=generator,
+        num_inference_steps=num_inference_steps,
+    )
+
+
+def official_preprocess_image(image_path: str | Path) -> torch.Tensor:
+    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Could not read official input image: {image_path}")
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    height, width, _ = image.shape
+    height, width = (height // 8) * 8, (width // 8) * 8
+    image = cv2.resize(image, (width, height))
+    max_value = float(np.max(image))
+    if max_value <= 0.0:
+        raise ValueError(f"Official input image has non-positive max value: {image_path}")
+    image = image.astype(np.float32) / max_value
+    tensor_image = torch.from_numpy(image).permute(2, 0, 1).float()
+    return tensor_image * 2.0 - 1.0
+
+
+def current_preprocess_image(image_path: str | Path, image_size: int | None) -> torch.Tensor:
+    rgb = PATestSplitDataset._read_rgb(Path(image_path))
+    if image_size is not None:
+        return PATestSplitDataset._resize_rgb(rgb, image_size)
+    height, width = rgb.shape[-2:]
+    target_height = (height // 8) * 8
+    target_width = (width // 8) * 8
+    if target_height == height and target_width == width:
+        return rgb
+    return PATestSplitDataset._resize_rgb_hw(rgb, target_height, target_width)
 
 
 def pipeline_output_to_raw_chw(image: np.ndarray) -> torch.Tensor:
@@ -675,6 +759,130 @@ def write_channel_order_diagnosis(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def run_fairness_check(
+    args: argparse.Namespace,
+    pipeline: StableDiffusionControlNetPipeline,
+    device: torch.device,
+) -> None:
+    report_path = Path(args.report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    input_dir = Path(args.official_input_folder) if args.official_input_folder else None
+    if input_dir is None:
+        if args.rgb_dir:
+            input_dir = Path(args.rgb_dir)
+        elif args.root_dir:
+            input_dir = PATestSplitDataset(
+                root_dir=args.root_dir,
+                rgb_dir=None,
+                gt_dir=args.gt_dir,
+                image_size=args.image_size,
+            ).rgb_dir
+        else:
+            raise ValueError("fairness_check needs root_dir, rgb_dir, or official_input_folder.")
+
+    image_files = [
+        path for path in sorted(input_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ][:3]
+    if not image_files:
+        raise RuntimeError(f"No input images found for fairness_check under {input_dir}.")
+
+    results_dir = (
+        Path(args.official_results_folder)
+        if args.official_results_folder
+        else report_path.parent / "pa_fairness_check"
+    )
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# PA baseline runtime fairness check",
+        "",
+        f"checkpoint: {args.checkpoint}",
+        f"pretrained_model_name_or_path: {args.pretrained_model_name_or_path}",
+        f"official_input_folder: {input_dir}",
+        f"num_inference_steps: {args.num_inference_steps}",
+        f"seed: {args.seed}",
+        "",
+        "| sample | current_shape | official_shape | raw_mean_abs_diff | raw_max_abs_diff | final_mean_abs_diff | final_max_abs_diff | nearly_identical |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+
+    for index, image_path in enumerate(image_files):
+        sample_seed = args.seed + index
+        current_rgb = current_preprocess_image(image_path, args.image_size)
+        official_rgb = official_preprocess_image(image_path)
+
+        current_raw = run_pipeline_raw(
+            pipeline,
+            current_rgb,
+            device,
+            sample_seed,
+            args.num_inference_steps,
+        )
+        official_raw = run_pipeline_raw(
+            pipeline,
+            official_rgb,
+            device,
+            sample_seed,
+            args.num_inference_steps,
+        )
+
+        current_pred = interpret_raw_output(
+            current_raw,
+            CHANNEL_ORDER_CANDIDATES["A_[DoLP,cos2,sin2]"],
+        )
+        official_pred = interpret_raw_output(
+            official_raw,
+            CHANNEL_ORDER_CANDIDATES["A_[DoLP,cos2,sin2]"],
+        )
+
+        raw_a, raw_b = align_pair(current_raw, official_raw)
+        pred_a, pred_b = align_pair(current_pred, official_pred)
+        raw_diff = (raw_a - raw_b).abs()
+        final_diff = (pred_a - pred_b).abs()
+        raw_mean = float(raw_diff.mean())
+        raw_max = float(raw_diff.max())
+        final_mean = float(final_diff.mean())
+        final_max = float(final_diff.max())
+        nearly_identical = raw_max < 1e-5 and final_max < 1e-5
+
+        np.save(results_dir / f"{image_path.stem}_current_raw.npy", current_raw.numpy().astype(np.float32))
+        np.save(results_dir / f"{image_path.stem}_official_raw.npy", official_raw.numpy().astype(np.float32))
+        np.save(results_dir / f"{image_path.stem}_current_pred.npy", current_pred.numpy().astype(np.float32))
+        np.save(results_dir / f"{image_path.stem}_official_pred.npy", official_pred.numpy().astype(np.float32))
+
+        lines.append(
+            f"| {image_path.name} | {tuple(current_raw.shape)} | {tuple(official_raw.shape)} | "
+            f"{raw_mean:.8f} | {raw_max:.8f} | {final_mean:.8f} | {final_max:.8f} | "
+            f"{nearly_identical} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Notes:",
+            "- current_shape uses this script's preprocessing, including --image_size when provided.",
+            "- official_shape uses PolarAnything infer.py preprocessing: cv2 BGR->RGB, floor to multiple of 8, divide by image max, then [-1,1].",
+            "- Raw/final arrays are saved under the fairness-check output folder for inspection.",
+        ]
+    )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Wrote fairness check report to {report_path}", flush=True)
+
+
+def align_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.shape[-2:] == b.shape[-2:]:
+        return a, b
+    b_resized = torch.nn.functional.interpolate(
+        b.unsqueeze(0),
+        size=a.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    return a, b_resized
+
+
 def write_summary(
     summary_path: Path,
     args: argparse.Namespace,
@@ -732,6 +940,8 @@ def run(args: argparse.Namespace) -> None:
 
     dataloader, dataset_size = build_dataloader(args, device)
     pipeline = build_pipeline(args, device)
+    if args.fairness_check:
+        run_fairness_check(args, pipeline, device)
 
     rows: list[dict[str, float | str]] = []
     diagnosis_metrics = {name: [] for name in CHANNEL_ORDER_CANDIDATES}
