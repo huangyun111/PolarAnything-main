@@ -40,6 +40,14 @@ METRIC_NAMES = (
     "weighted_aolp_error_deg",
     "high_dolp_aolp_error_deg",
 )
+CHANNEL_ORDER_CANDIDATES = {
+    "A_[DoLP,cos2,sin2]": (0, 1, 2),
+    "B_[DoLP,sin2,cos2]": (0, 2, 1),
+    "C_[cos2,DoLP,sin2]": (1, 0, 2),
+    "D_[sin2,DoLP,cos2]": (1, 2, 0),
+    "E_[cos2,sin2,DoLP]": (2, 0, 1),
+    "F_[sin2,cos2,DoLP]": (2, 1, 0),
+}
 
 
 class PolarControlTest(ControlNetModel):
@@ -281,6 +289,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--save_pred_png", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save_raw_outputs", action="store_true")
+    parser.add_argument("--diagnose_channel_order", action="store_true")
     return parser.parse_args()
 
 
@@ -438,19 +448,44 @@ def infer_one(
         generator=generator,
     )
     image = result.images[0].astype(np.float32)
-    pred = pipeline_output_to_polar(image)
-    return pred.cpu()
+    raw = pipeline_output_to_raw_chw(image)
+    return raw.cpu()
+
+
+def pipeline_output_to_raw_chw(image: np.ndarray) -> torch.Tensor:
+    image = image.astype(np.float32)
+    if image.ndim != 3 or image.shape[-1] < 3:
+        raise ValueError(f"Expected pipeline RGB output with at least 3 channels, got {image.shape}.")
+    return torch.from_numpy(image[..., :3].transpose(2, 0, 1).copy()).float()
 
 
 def pipeline_output_to_polar(image: np.ndarray) -> torch.Tensor:
-    image = np.clip(image, 0.0, 1.0).astype(np.float32)
-    if image.ndim != 3 or image.shape[-1] < 3:
-        raise ValueError(f"Expected pipeline RGB output with at least 3 channels, got {image.shape}.")
-    dolp = image[..., 0]
-    cos2 = image[..., 1] * 2.0 - 1.0
-    sin2 = image[..., 2] * 2.0 - 1.0
-    polar = torch.from_numpy(np.stack((dolp, cos2, sin2), axis=0).astype(np.float32))
+    raw = pipeline_output_to_raw_chw(image)
+    return interpret_raw_output(raw, CHANNEL_ORDER_CANDIDATES["A_[DoLP,cos2,sin2]"])
+
+
+def interpret_raw_output(raw: torch.Tensor, order: tuple[int, int, int]) -> torch.Tensor:
+    dolp = map_dolp_channel(raw[order[0]])
+    cos2 = map_angle_channel(raw[order[1]])
+    sin2 = map_angle_channel(raw[order[2]])
+    polar = torch.stack((dolp, cos2, sin2), dim=0).float()
     return normalize_polar_tensor(polar)
+
+
+def map_dolp_channel(channel: torch.Tensor) -> torch.Tensor:
+    min_value = float(channel.detach().min())
+    max_value = float(channel.detach().max())
+    if min_value >= -1.1 and max_value <= 1.1 and min_value < -0.05:
+        return ((channel + 1.0) * 0.5).clamp(0.0, 1.0)
+    return channel.clamp(0.0, 1.0)
+
+
+def map_angle_channel(channel: torch.Tensor) -> torch.Tensor:
+    min_value = float(channel.detach().min())
+    max_value = float(channel.detach().max())
+    if min_value >= -1.1 and max_value <= 1.1 and min_value < -0.05:
+        return channel.clamp(-1.0, 1.0)
+    return (channel * 2.0 - 1.0).clamp(-1.0, 1.0)
 
 
 def normalize_polar_tensor(polar: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -595,6 +630,51 @@ def summarize_rows(rows: list[dict[str, float | str]]) -> dict[str, float]:
     return summary
 
 
+def summarize_metric_dicts(metric_dicts: list[dict[str, float]]) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    for metric_name in METRIC_NAMES:
+        values = np.array([float(row[metric_name]) for row in metric_dicts], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        summary[metric_name] = float(finite.mean()) if finite.size else float("nan")
+    return summary
+
+
+def write_channel_order_diagnosis(
+    path: Path,
+    diagnosis_metrics: dict[str, list[dict[str, float]]],
+) -> None:
+    summaries = {
+        name: summarize_metric_dicts(rows)
+        for name, rows in diagnosis_metrics.items()
+        if rows
+    }
+    if not summaries:
+        path.write_text("No channel order diagnosis samples were processed.\n", encoding="utf-8")
+        return
+
+    best_dolp = min(summaries, key=lambda name: summaries[name]["dolp_mae"])
+    best_aolp = min(summaries, key=lambda name: summaries[name]["weighted_aolp_error_deg"])
+    best_vector = min(summaries, key=lambda name: summaries[name]["cos_sin_vector_error"])
+
+    lines = [
+        "PolarAnything raw output channel-order diagnosis",
+        "",
+        f"Best DoLP MAE: {best_dolp}",
+        f"Best weighted AoLP error: {best_aolp}",
+        f"Best vector error: {best_vector}",
+        "",
+        "Mean metrics by interpretation:",
+    ]
+    for name in CHANNEL_ORDER_CANDIDATES:
+        if name not in summaries:
+            continue
+        lines.append("")
+        lines.append(name)
+        for metric_name in METRIC_NAMES:
+            lines.append(f"  {metric_name}: {format_float(summaries[name][metric_name])}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_summary(
     summary_path: Path,
     args: argparse.Namespace,
@@ -641,16 +721,20 @@ def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     pred_npy_dir = output_dir / "pred_npy"
     pred_png_dir = output_dir / "pred_png"
+    raw_npy_dir = output_dir / "raw_npy"
     vis_dir = output_dir / "vis"
     pred_npy_dir.mkdir(parents=True, exist_ok=True)
     if args.save_pred_png:
         pred_png_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_raw_outputs:
+        raw_npy_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     dataloader, dataset_size = build_dataloader(args, device)
     pipeline = build_pipeline(args, device)
 
     rows: list[dict[str, float | str]] = []
+    diagnosis_metrics = {name: [] for name in CHANNEL_ORDER_CANDIDATES}
     processed = 0
     resized_output_count = 0
     with torch.no_grad():
@@ -663,13 +747,25 @@ def run(args: argparse.Namespace) -> None:
                 sample_index = processed + offset
                 rgb = rgb_batch[offset].cpu()
                 gt = gt_batch[offset].cpu()
-                pred = infer_one(
+                raw = infer_one(
                     pipeline=pipeline,
                     rgb=rgb,
                     device=device,
                     generator=generator,
                     num_inference_steps=args.num_inference_steps,
                 )
+                if args.save_raw_outputs:
+                    np.save(raw_npy_dir / f"{name}.npy", raw.numpy().astype(np.float32))
+
+                if args.diagnose_channel_order:
+                    for candidate_name, order in CHANNEL_ORDER_CANDIDATES.items():
+                        candidate_pred = interpret_raw_output(raw, order)
+                        candidate_pred, _ = resize_prediction_to_gt(candidate_pred, gt)
+                        diagnosis_metrics[candidate_name].append(
+                            compute_metric_dict(candidate_pred, gt)
+                        )
+
+                pred = interpret_raw_output(raw, CHANNEL_ORDER_CANDIDATES["A_[DoLP,cos2,sin2]"])
                 pred, resized = resize_prediction_to_gt(pred, gt)
                 if resized:
                     resized_output_count += 1
@@ -689,6 +785,11 @@ def run(args: argparse.Namespace) -> None:
             print(f"processed {processed}/{dataset_size}", flush=True)
 
     write_metrics_csv(output_dir / "metrics.csv", rows)
+    if args.diagnose_channel_order:
+        write_channel_order_diagnosis(
+            output_dir / "channel_order_diagnosis.txt",
+            diagnosis_metrics,
+        )
     summary = summarize_rows(rows)
     write_summary(
         summary_path=output_dir / "summary.txt",
