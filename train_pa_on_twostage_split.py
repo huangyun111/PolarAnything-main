@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--save_freq", type=int, default=10)
+    parser.add_argument("--save_last_freq", type=int, default=1)
+    parser.add_argument("--val_freq", type=int, default=1)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -70,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--save_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save optimizer state in checkpoints. Disabled by default to avoid very large PA checkpoints.",
+    )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention",
         action=argparse.BooleanOptionalAction,
@@ -384,18 +392,20 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     best_val_loss: float,
     args: argparse.Namespace,
+    include_optimizer: bool,
 ) -> None:
     state = {
         "epoch": epoch,
         "global_step": global_step,
         "unet_state_dict": unet.state_dict(),
         "controlnet_state_dict": controlnet.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
         "config": vars(args),
         "clean_baseline": True,
         "initialized_from_pa_final_model": False,
     }
+    if include_optimizer:
+        state["optimizer_state_dict"] = optimizer.state_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
 
@@ -418,6 +428,8 @@ def load_resume_checkpoint(
     controlnet.load_state_dict(remove_module_prefix(checkpoint["controlnet_state_dict"]))
     if "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    else:
+        print("Resume checkpoint has no optimizer_state_dict; optimizer starts fresh.", flush=True)
     start_epoch = int(checkpoint.get("epoch", 0)) + 1
     global_step = int(checkpoint.get("global_step", 0))
     best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
@@ -499,6 +511,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("num_epochs must be positive.")
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
+    if args.val_freq <= 0:
+        raise ValueError("val_freq must be positive.")
+    if args.save_last_freq <= 0:
+        raise ValueError("save_last_freq must be positive.")
 
     apply_hf_cache_env(args.hf_cache_dir)
     torch.manual_seed(args.seed)
@@ -541,6 +557,11 @@ def train(args: argparse.Namespace) -> None:
         f"{path_looks_like_test_split(args.val_root_dir) or path_looks_like_test_split(args.val_manifest)}",
     )
     log_line(log_path, "trainable_modules=unet,controlnet frozen_modules=vae,text_encoder")
+    log_line(
+        log_path,
+        f"val_freq={args.val_freq} save_last_freq={args.save_last_freq} "
+        f"save_optimizer={args.save_optimizer}",
+    )
 
     start_epoch, global_step, best_val_loss = load_resume_checkpoint(
         resume=args.resume,
@@ -588,33 +609,48 @@ def train(args: argparse.Namespace) -> None:
                 )
 
         train_loss = float(sum(epoch_losses) / max(len(epoch_losses), 1))
-        val_loss = validate(
-            val_loader=val_loader,
-            encoder=encoder,
-            vae=vae,
-            scheduler=scheduler,
-            unet=unet,
-            controlnet=controlnet,
-            device=device,
-        )
+        should_validate = (epoch + 1) % args.val_freq == 0 or (epoch + 1) == args.num_epochs
+        val_loss = None
+        if should_validate:
+            val_loss = validate(
+                val_loader=val_loader,
+                encoder=encoder,
+                vae=vae,
+                scheduler=scheduler,
+                unet=unet,
+                controlnet=controlnet,
+                device=device,
+            )
         elapsed_min = (time.time() - start_time) / 60.0
-        log_line(
-            log_path,
-            f"epoch={epoch + 1} train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} elapsed_min={elapsed_min:.2f}",
-        )
+        if val_loss is None:
+            log_line(
+                log_path,
+                f"epoch={epoch + 1} train_loss={train_loss:.6f} "
+                f"val_loss=skipped elapsed_min={elapsed_min:.2f}",
+            )
+        else:
+            log_line(
+                log_path,
+                f"epoch={epoch + 1} train_loss={train_loss:.6f} "
+                f"val_loss={val_loss:.6f} elapsed_min={elapsed_min:.2f}",
+            )
 
-        save_checkpoint(
-            output_dir / "last.pth",
-            epoch=epoch,
-            global_step=global_step,
-            unet=unet,
-            controlnet=controlnet,
-            optimizer=optimizer,
-            best_val_loss=min(best_val_loss, val_loss),
-            args=args,
-        )
-        if val_loss < best_val_loss:
+        should_save_last = (epoch + 1) % args.save_last_freq == 0 or (epoch + 1) == args.num_epochs
+        if should_save_last:
+            save_checkpoint(
+                output_dir / "last.pth",
+                epoch=epoch,
+                global_step=global_step,
+                unet=unet,
+                controlnet=controlnet,
+                optimizer=optimizer,
+                best_val_loss=best_val_loss if val_loss is None else min(best_val_loss, val_loss),
+                args=args,
+                include_optimizer=args.save_optimizer,
+            )
+            log_line(log_path, f"last_saved epoch={epoch + 1}")
+
+        if val_loss is not None and val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(
                 output_dir / "best_val.pth",
@@ -625,6 +661,7 @@ def train(args: argparse.Namespace) -> None:
                 optimizer=optimizer,
                 best_val_loss=best_val_loss,
                 args=args,
+                include_optimizer=args.save_optimizer,
             )
             log_line(log_path, f"best_val_updated epoch={epoch + 1} val_loss={val_loss:.6f}")
 
@@ -638,11 +675,13 @@ def train(args: argparse.Namespace) -> None:
                 optimizer=optimizer,
                 best_val_loss=best_val_loss,
                 args=args,
+                include_optimizer=args.save_optimizer,
             )
             prune_epoch_checkpoints(output_dir, args.save_total_limit)
 
-        first_val_batch = next(iter(val_loader))
-        save_validation_visual(first_val_batch, output_dir / "vis" / f"epoch_{epoch + 1:04d}.png")
+        if should_validate:
+            first_val_batch = next(iter(val_loader))
+            save_validation_visual(first_val_batch, output_dir / "vis" / f"epoch_{epoch + 1:04d}.png")
 
     log_line(log_path, f"training_finished best_val_loss={best_val_loss:.6f}")
 
