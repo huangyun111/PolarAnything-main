@@ -73,6 +73,14 @@ class PATwostageDatasetTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "test split"):
                 PATwostageDataset(root_dir=root, tokenizer=None, image_size=8)
 
+            dataset = PATwostageDataset(
+                root_dir=root,
+                tokenizer=None,
+                image_size=8,
+                forbid_test_split=False,
+            )
+            self.assertEqual(len(dataset), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
