@@ -243,6 +243,7 @@ def build_dataset(
         random_crop=args.random_crop and split_name == "train",
         normalize_mode=args.normalize_mode,
         seed=args.seed,
+        forbid_test_split=split_name == "train",
     )
 
 
@@ -462,17 +463,27 @@ def save_validation_visual(batch: dict[str, torch.Tensor], output_path: Path) ->
 
 
 def write_config(path: Path, args: argparse.Namespace, train_count: int, val_count: int) -> None:
+    uses_test_for_validation = path_looks_like_test_split(args.val_root_dir) or path_looks_like_test_split(
+        args.val_manifest
+    )
     payload = {
         **vars(args),
         "train_samples": train_count,
         "val_samples": val_count,
         "uses_pa_final_model": False,
-        "uses_test_for_training_or_checkpoint_selection": False,
+        "uses_test_for_training": False,
+        "uses_test_for_validation_or_checkpoint_selection": uses_test_for_validation,
         "trainable_modules": ["unet", "controlnet"],
         "frozen_modules": ["vae", "text_encoder"],
         "gt_channel_order": "[DoLP, cos(2AoLP), sin(2AoLP)]",
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def path_looks_like_test_split(value: str | None) -> bool:
+    if value is None:
+        return False
+    return "test" in {part.lower() for part in Path(value).expanduser().parts}
 
 
 def log_line(log_path: Path, message: str) -> None:
@@ -523,7 +534,12 @@ def train(args: argparse.Namespace) -> None:
     write_config(output_dir / "config.json", args, train_count, val_count)
     log_line(log_path, f"train_samples={train_count} val_samples={val_count}")
     log_line(log_path, "uses_PA_Final_Model=False")
-    log_line(log_path, "uses_test_for_training_or_checkpoint_selection=False")
+    log_line(log_path, "uses_test_for_training=False")
+    log_line(
+        log_path,
+        "uses_test_for_validation_or_checkpoint_selection="
+        f"{path_looks_like_test_split(args.val_root_dir) or path_looks_like_test_split(args.val_manifest)}",
+    )
     log_line(log_path, "trainable_modules=unet,controlnet frozen_modules=vae,text_encoder")
 
     start_epoch, global_step, best_val_loss = load_resume_checkpoint(
