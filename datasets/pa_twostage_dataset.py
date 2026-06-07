@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import imageio.v3 as iio
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -20,6 +21,9 @@ class PATwostageDataset(Dataset):
 
     The physical GT tensor is always [DoLP, cos(2AoLP), sin(2AoLP)]. The
     training target passed to the VAE is [2*DoLP-1, cos(2AoLP), sin(2AoLP)].
+
+    official_train reads images like the author code, then resizes the short
+    side to crop_size only when needed so every sample can provide a 512 crop.
     """
 
     def __init__(
@@ -30,6 +34,8 @@ class PATwostageDataset(Dataset):
         manifest_path: str | Path | None = None,
         tokenizer: Any | None = None,
         image_size: int | None = 256,
+        preprocess_mode: str = "aligned256",
+        crop_size: int = 512,
         resize_mode: str = "resize",
         random_crop: bool = False,
         normalize_mode: str = "fixed255",
@@ -44,6 +50,8 @@ class PATwostageDataset(Dataset):
         )
         self.tokenizer = tokenizer
         self.image_size = image_size
+        self.preprocess_mode = preprocess_mode
+        self.crop_size = crop_size
         self.resize_mode = resize_mode
         self.random_crop = random_crop
         self.normalize_mode = normalize_mode
@@ -55,9 +63,19 @@ class PATwostageDataset(Dataset):
                 raise ValueError("image_size must be positive or None.")
             if self.image_size % 8 != 0:
                 raise ValueError("image_size must be divisible by 8 for Stable Diffusion.")
+        if self.crop_size <= 0:
+            raise ValueError("crop_size must be positive.")
+        if self.crop_size % 8 != 0:
+            raise ValueError("crop_size must be divisible by 8 for Stable Diffusion.")
+        if self.preprocess_mode not in {"aligned256", "official_train"}:
+            raise ValueError(f"Unsupported preprocess_mode: {self.preprocess_mode}")
         if self.resize_mode not in {"resize", "center_crop", "none"}:
             raise ValueError(f"Unsupported resize_mode: {self.resize_mode}")
-        if self.random_crop and self.resize_mode != "center_crop":
+        if (
+            self.preprocess_mode == "aligned256"
+            and self.random_crop
+            and self.resize_mode != "center_crop"
+        ):
             raise ValueError("random_crop is only supported with resize_mode='center_crop'.")
         if self.normalize_mode not in {"fixed255", "image_max", "dtype"}:
             raise ValueError(f"Unsupported normalize_mode: {self.normalize_mode}")
@@ -84,13 +102,22 @@ class PATwostageDataset(Dataset):
         rgb_path, gt_path, name = self.samples[index]
         rng = random.Random(self.seed + index)
 
-        rgb = read_rgb_image(rgb_path, normalize_mode=self.normalize_mode)
-        polar_gt = read_polar_encoding(gt_path)
+        if self.preprocess_mode == "official_train":
+            rgb = read_author_rgb_image(rgb_path, normalize_mode=self.normalize_mode)
+            polar_gt = read_author_polar_encoding(gt_path)
+            target_size = self.crop_size
+            resize_mode = "center_crop"
+        else:
+            rgb = read_rgb_image(rgb_path, normalize_mode=self.normalize_mode)
+            polar_gt = read_polar_encoding(gt_path)
+            target_size = self.image_size
+            resize_mode = self.resize_mode
+
         rgb, polar_gt = transform_pair(
             rgb=rgb,
             polar=polar_gt,
-            image_size=self.image_size,
-            resize_mode=self.resize_mode,
+            image_size=target_size,
+            resize_mode=resize_mode,
             random_crop=self.random_crop,
             rng=rng,
         )
@@ -198,6 +225,26 @@ def read_rgb_image(path: str | Path, normalize_mode: str = "fixed255") -> torch.
     return torch.from_numpy(array).permute(2, 0, 1).float()
 
 
+def read_author_rgb_image(path: str | Path, normalize_mode: str = "image_max") -> torch.Tensor:
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Could not read RGB/S0 image: {path}")
+    image = bgr_like_to_rgb(image)
+    array = image.astype(np.float32)
+    if normalize_mode == "image_max":
+        max_value = float(np.nanmax(array))
+        if max_value <= 0.0:
+            raise ValueError(f"RGB/S0 image has non-positive max value: {path}")
+        denom = max_value
+    elif normalize_mode == "dtype":
+        denom = dtype_max(image.dtype)
+    else:
+        denom = 255.0
+    array = np.clip(array / denom, 0.0, 1.0)
+    array = array * 2.0 - 1.0
+    return torch.from_numpy(array).permute(2, 0, 1).float()
+
+
 def read_polar_encoding(path: str | Path) -> torch.Tensor:
     encoded = iio.imread(path)
     if encoded.ndim != 3 or encoded.shape[-1] < 3:
@@ -208,6 +255,30 @@ def read_polar_encoding(path: str | Path) -> torch.Tensor:
     cos2 = (unit[..., 1] * 2.0 - 1.0).clip(-1.0, 1.0)
     sin2 = (unit[..., 2] * 2.0 - 1.0).clip(-1.0, 1.0)
     return torch.from_numpy(np.stack((dolp, cos2, sin2), axis=0)).float()
+
+
+def read_author_polar_encoding(path: str | Path) -> torch.Tensor:
+    encoded = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if encoded is None:
+        raise FileNotFoundError(f"Could not read Polarization_Encoding image: {path}")
+    if encoded.ndim != 3 or encoded.shape[-1] < 3:
+        raise ValueError(f"Expected 3-channel Polarization_Encoding image: {path}")
+    encoded_rgb = bgr_like_to_rgb(encoded)
+    unit = encoded_rgb[..., :3].astype(np.float32) / dtype_max(encoded_rgb.dtype)
+    dolp = unit[..., 0].clip(0.0, 1.0)
+    cos2 = (unit[..., 1] * 2.0 - 1.0).clip(-1.0, 1.0)
+    sin2 = (unit[..., 2] * 2.0 - 1.0).clip(-1.0, 1.0)
+    return torch.from_numpy(np.stack((dolp, cos2, sin2), axis=0)).float()
+
+
+def bgr_like_to_rgb(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    if image.ndim != 3 or image.shape[-1] < 3:
+        raise ValueError(f"Expected image with at least 3 channels, got {image.shape}.")
+    if image.shape[-1] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    return cv2.cvtColor(image[..., :3], cv2.COLOR_BGR2RGB)
 
 
 def dtype_max(dtype: np.dtype) -> float:
@@ -267,14 +338,13 @@ def resize_tensor_hw(
     width: int,
     is_rgb: bool,
 ) -> torch.Tensor:
-    channels = tensor.permute(1, 2, 0).numpy()
     if is_rgb:
-        unit = ((channels + 1.0) * 0.5).clip(0.0, 1.0)
-        image = Image.fromarray((unit * 255.0).round().astype(np.uint8), mode="RGB")
-        resized = image.resize((width, height), Image.BILINEAR)
-        array = np.asarray(resized, dtype=np.float32) / 255.0
-        array = array * 2.0 - 1.0
-        return torch.from_numpy(array).permute(2, 0, 1).float()
+        resized_channels = []
+        for channel in tensor:
+            image = Image.fromarray(channel.numpy().astype(np.float32), mode="F")
+            resized = image.resize((width, height), Image.BILINEAR)
+            resized_channels.append(np.asarray(resized, dtype=np.float32))
+        return torch.from_numpy(np.stack(resized_channels, axis=0)).float().clamp(-1.0, 1.0)
 
     resized_channels = []
     for channel in tensor:

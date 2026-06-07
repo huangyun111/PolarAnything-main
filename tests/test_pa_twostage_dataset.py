@@ -5,9 +5,14 @@ import unittest
 from pathlib import Path
 
 import imageio.v3 as iio
+import cv2
 import numpy as np
 
-from datasets.pa_twostage_dataset import PATwostageDataset, read_polar_encoding
+from datasets.pa_twostage_dataset import (
+    PATwostageDataset,
+    read_author_polar_encoding,
+    read_polar_encoding,
+)
 
 
 class PATwostageDatasetTest(unittest.TestCase):
@@ -53,6 +58,45 @@ class PATwostageDatasetTest(unittest.TestCase):
         self.assertAlmostEqual(float(item["polarization"][0, 0, 0]), 1.0, places=5)
         self.assertAlmostEqual(float(item["polar_gt"][2, 0, 0]), 1.0, places=4)
         self.assertAlmostEqual(float(item["polarization"][2, 0, 0]), 1.0, places=4)
+
+    def test_official_train_uses_author_read_image_max_and_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            rgb_dir = root / "S0"
+            gt_dir = root / "Polarization_Encoding"
+            rgb_dir.mkdir()
+            gt_dir.mkdir()
+
+            bgr = np.zeros((6, 10, 3), dtype=np.uint8)
+            bgr[..., 0] = 10
+            bgr[..., 1] = 20
+            bgr[..., 2] = 40
+            cv2.imwrite(str(rgb_dir / "a.png"), bgr)
+
+            encoded_bgr = np.zeros((6, 10, 3), dtype=np.uint8)
+            encoded_bgr[..., 0] = 0
+            encoded_bgr[..., 1] = 255
+            encoded_bgr[..., 2] = 64
+            cv2.imwrite(str(gt_dir / "a.png"), encoded_bgr)
+
+            raw_polar = read_author_polar_encoding(gt_dir / "a.png")
+            dataset = PATwostageDataset(
+                root_dir=root,
+                tokenizer=None,
+                preprocess_mode="official_train",
+                crop_size=8,
+                normalize_mode="image_max",
+            )
+            item = dataset[0]
+
+        self.assertEqual(tuple(item["rgb"].shape), (3, 8, 8))
+        self.assertEqual(tuple(item["polarization"].shape), (3, 8, 8))
+        self.assertAlmostEqual(float(item["rgb"][0, 0, 0]), 1.0, places=5)
+        self.assertAlmostEqual(float(item["rgb"][1, 0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(item["rgb"][2, 0, 0]), -0.5, places=5)
+        self.assertAlmostEqual(float(raw_polar[0, 0, 0]), 64 / 255, places=5)
+        self.assertAlmostEqual(float(raw_polar[1, 0, 0]), 1.0, places=5)
+        self.assertAlmostEqual(float(raw_polar[2, 0, 0]), -1.0, places=5)
 
     def test_dataset_refuses_test_split_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

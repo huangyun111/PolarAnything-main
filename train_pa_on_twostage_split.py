@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("aligned256", "official_train"),
+        default="aligned256",
+    )
+    parser.add_argument("--crop_size", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -67,7 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normalize_mode",
         choices=("fixed255", "image_max", "dtype"),
-        default="fixed255",
+        default=None,
+        help="Defaults to fixed255 for aligned256 and image_max for official_train.",
     )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
@@ -84,6 +91,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     return parser.parse_args()
+
+
+def resolve_normalize_mode(preprocess_mode: str, normalize_mode: str | None) -> str:
+    if normalize_mode is not None:
+        return normalize_mode
+    if preprocess_mode == "official_train":
+        return "image_max"
+    return "fixed255"
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -247,9 +262,12 @@ def build_dataset(
         manifest_path=manifest_path,
         tokenizer=tokenizer,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        crop_size=args.crop_size,
         resize_mode=args.resize_mode,
-        random_crop=args.random_crop and split_name == "train",
-        normalize_mode=args.normalize_mode,
+        random_crop=(args.preprocess_mode == "official_train" or args.random_crop)
+        and split_name == "train",
+        normalize_mode=args.resolved_normalize_mode,
         seed=args.seed,
         forbid_test_split=split_name == "train",
     )
@@ -485,6 +503,16 @@ def write_config(path: Path, args: argparse.Namespace, train_count: int, val_cou
         "uses_pa_final_model": False,
         "uses_test_for_training": False,
         "uses_test_for_validation_or_checkpoint_selection": uses_test_for_validation,
+        "preprocess_mode": args.preprocess_mode,
+        "crop_size": args.crop_size,
+        "normalize_mode": args.resolved_normalize_mode,
+        "train_random_crop": args.preprocess_mode == "official_train" or args.random_crop,
+        "crop_strategy": (
+            "official_train resizes the short side to crop_size only when needed, "
+            "then random-crops train samples and center-crops validation samples."
+            if args.preprocess_mode == "official_train"
+            else "aligned256 uses image_size with the selected resize_mode."
+        ),
         "trainable_modules": ["unet", "controlnet"],
         "frozen_modules": ["vae", "text_encoder"],
         "gt_channel_order": "[DoLP, cos(2AoLP), sin(2AoLP)]",
@@ -515,8 +543,16 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("val_freq must be positive.")
     if args.save_last_freq <= 0:
         raise ValueError("save_last_freq must be positive.")
+    if args.crop_size <= 0:
+        raise ValueError("crop_size must be positive.")
+    if args.crop_size % 8 != 0:
+        raise ValueError("crop_size must be divisible by 8 for Stable Diffusion.")
 
     apply_hf_cache_env(args.hf_cache_dir)
+    args.resolved_normalize_mode = resolve_normalize_mode(
+        args.preprocess_mode,
+        args.normalize_mode,
+    )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -557,6 +593,11 @@ def train(args: argparse.Namespace) -> None:
         f"{path_looks_like_test_split(args.val_root_dir) or path_looks_like_test_split(args.val_manifest)}",
     )
     log_line(log_path, "trainable_modules=unet,controlnet frozen_modules=vae,text_encoder")
+    log_line(
+        log_path,
+        f"preprocess_mode={args.preprocess_mode} crop_size={args.crop_size} "
+        f"image_size={args.image_size} normalize_mode={args.resolved_normalize_mode}",
+    )
     log_line(
         log_path,
         f"val_freq={args.val_freq} save_last_freq={args.save_last_freq} "
