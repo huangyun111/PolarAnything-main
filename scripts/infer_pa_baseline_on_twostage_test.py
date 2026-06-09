@@ -39,6 +39,11 @@ METRIC_NAMES = (
     "cos_sin_vector_error",
     "weighted_aolp_error_deg",
     "high_dolp_aolp_error_deg",
+    "dop_mae",
+    "dop_rmse",
+    "aop_mae_deg",
+    "weighted_aop_mae_deg",
+    "high_dop_aop_mae_deg",
 )
 CHANNEL_ORDER_CANDIDATES = {
     "A_[DoLP,cos2,sin2]": (0, 1, 2),
@@ -707,16 +712,23 @@ def resize_prediction_to_gt_if_requested(
     return resize_prediction_to_gt(pred, gt)
 
 
-def save_pred_png(path: Path, pred: torch.Tensor) -> None:
-    dolp = pred[0].clamp(0.0, 1.0)
-    cos2 = ((pred[1].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
-    sin2 = ((pred[2].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+def save_polar_encoding_png(path: Path, polar: torch.Tensor) -> None:
+    """Save uint16 PA-style RGB semantics [DoLP, cos2, sin2]."""
+    polar = polar.detach().float().cpu()
+    dolp = polar[0].clamp(0.0, 1.0)
+    cos2 = ((polar[1].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+    sin2 = ((polar[2].clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
     encoded_rgb = torch.stack((dolp, cos2, sin2), dim=-1).numpy()
-    encoded_uint16 = (encoded_rgb * 65535.0).round().astype(np.uint16)
+    encoded_uint16 = (encoded_rgb * 65535.0).round().clip(0, 65535).astype(np.uint16)
     encoded_bgr = cv2.cvtColor(encoded_uint16, cv2.COLOR_RGB2BGR)
+    path.parent.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(str(path), encoded_bgr)
     if not ok:
-        raise RuntimeError(f"Failed to write prediction PNG: {path}")
+        raise RuntimeError(f"Failed to write polarization encoding PNG: {path}")
+
+
+def save_pred_png(path: Path, pred: torch.Tensor) -> None:
+    save_polar_encoding_png(path, pred)
 
 
 def compute_metric_dict(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
@@ -728,19 +740,29 @@ def compute_metric_dict(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float
     vector_error = torch.sqrt((pred[1] - gt[1]) ** 2 + (pred[2] - gt[2]) ** 2)
 
     dot = pred[1] * gt[1] + pred[2] * gt[2]
-    err_2aolp = torch.arccos(dot.clamp(-1.0, 1.0))
+    cross = pred[2] * gt[1] - pred[1] * gt[2]
+    err_2aolp = torch.atan2(cross.abs(), dot)
     err_aolp_deg = err_2aolp * 0.5 * (180.0 / math.pi)
     reliability = torch.clamp((gt[0] - 0.03) / (0.15 - 0.03), 0.0, 1.0)
     high_mask = gt[0] > 0.15
+    dolp_mae = float(dolp_error.mean())
+    dolp_rmse = float(torch.sqrt(torch.mean((pred[0] - gt[0]) ** 2)))
+    weighted_aop_mae_deg = weighted_mean(err_aolp_deg, reliability)
+    high_dop_aop_mae_deg = masked_mean(err_aolp_deg, high_mask)
 
     return {
-        "dolp_mae": float(dolp_error.mean()),
-        "dolp_rmse": float(torch.sqrt(torch.mean((pred[0] - gt[0]) ** 2))),
+        "dolp_mae": dolp_mae,
+        "dolp_rmse": dolp_rmse,
         "cos_mae": float(cos_error.mean()),
         "sin_mae": float(sin_error.mean()),
         "cos_sin_vector_error": float(vector_error.mean()),
-        "weighted_aolp_error_deg": weighted_mean(err_aolp_deg, reliability),
-        "high_dolp_aolp_error_deg": masked_mean(err_aolp_deg, high_mask),
+        "weighted_aolp_error_deg": weighted_aop_mae_deg,
+        "high_dolp_aolp_error_deg": high_dop_aop_mae_deg,
+        "dop_mae": dolp_mae,
+        "dop_rmse": dolp_rmse,
+        "aop_mae_deg": float(err_aolp_deg.mean()),
+        "weighted_aop_mae_deg": weighted_aop_mae_deg,
+        "high_dop_aop_mae_deg": high_dop_aop_mae_deg,
     }
 
 
@@ -768,6 +790,28 @@ def to_display_map(tensor: torch.Tensor, value_range: tuple[float, float]) -> np
     return np.clip((array - min_value) / (max_value - min_value), 0.0, 1.0)
 
 
+def polar_to_aolp(polar: torch.Tensor) -> torch.Tensor:
+    return 0.5 * torch.atan2(polar[2], polar[1])
+
+
+def aolp_to_display(aolp: torch.Tensor) -> np.ndarray:
+    return np.clip((aolp.detach().cpu().numpy() + math.pi / 2.0) / math.pi, 0.0, 1.0)
+
+
+def compute_aolp_error_deg_map(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    dot = pred[1] * gt[1] + pred[2] * gt[2]
+    cross = pred[2] * gt[1] - pred[1] * gt[2]
+    return torch.atan2(cross.abs(), dot) * 0.5 * (180.0 / math.pi)
+
+
+def polar_encoding_display(polar: torch.Tensor) -> np.ndarray:
+    polar = polar.detach().cpu()
+    red = polar[0].clamp(0.0, 1.0).numpy()
+    green = (polar[1].clamp(-1.0, 1.0).numpy() * 0.5 + 0.5)
+    blue = (polar[2].clamp(-1.0, 1.0).numpy() * 0.5 + 0.5)
+    return np.stack((red, green, blue), axis=-1)
+
+
 def save_visualization(
     rgb: torch.Tensor,
     gt: torch.Tensor,
@@ -776,22 +820,18 @@ def save_visualization(
 ) -> None:
     rgb_image = tensor_to_rgb_image(rgb)
     dolp_error = (pred[0] - gt[0]).abs()
-    vector_error = torch.sqrt((pred[1] - gt[1]) ** 2 + (pred[2] - gt[2]) ** 2)
-    reliability = torch.clamp((gt[0] - 0.03) / (0.15 - 0.03), 0.0, 1.0)
-    high_mask = (gt[0] > 0.15).float()
+    aolp_error = compute_aolp_error_deg_map(pred, gt)
 
     panels = [
-        ("RGB", rgb_image, None),
+        ("RGB / S0", rgb_image, None),
         ("GT DoLP", gt[0].numpy(), (0.0, 1.0)),
         ("PA pred DoLP", pred[0].numpy(), (0.0, 1.0)),
         ("DoLP error", dolp_error.numpy(), (0.0, 1.0)),
-        ("GT cos2", to_display_map(gt[1], (-1.0, 1.0)), (0.0, 1.0)),
-        ("PA pred cos2", to_display_map(pred[1], (-1.0, 1.0)), (0.0, 1.0)),
-        ("GT sin2", to_display_map(gt[2], (-1.0, 1.0)), (0.0, 1.0)),
-        ("PA pred sin2", to_display_map(pred[2], (-1.0, 1.0)), (0.0, 1.0)),
-        ("Vector error", vector_error.numpy(), (0.0, 2.0)),
-        ("Reliability", reliability.numpy(), (0.0, 1.0)),
-        ("High-DoLP mask", high_mask.numpy(), (0.0, 1.0)),
+        ("GT AoLP", aolp_to_display(polar_to_aolp(gt)), (0.0, 1.0)),
+        ("PA pred AoLP", aolp_to_display(polar_to_aolp(pred)), (0.0, 1.0)),
+        ("AoLP error", aolp_error.numpy(), (0.0, 90.0)),
+        ("GT Polarization Encoding", polar_encoding_display(gt), None),
+        ("PA pred Polarization Encoding", polar_encoding_display(pred), None),
     ]
 
     fig, axes = plt.subplots(3, 4, figsize=(16, 12))
@@ -1033,6 +1073,12 @@ def write_summary(
         f"resize_output_to_gt: {args.resize_output_to_gt}",
         f"resized_outputs_to_gt: {resized_output_count}",
         f"output_resized_to_gt_count: {resized_output_count}",
+        "saved_pred_encoding_png: True",
+        "saved_gt_encoding_png: True",
+        "encoding_png_dtype: uint16",
+        "encoding_png_channel_order: [DoLP, cos2, sin2]",
+        "aolp_visualization_range: [-90deg, 90deg]",
+        "aolp_error_range_deg: [0, 90]",
         "",
         "Mean metrics:",
     ]
@@ -1074,9 +1120,13 @@ def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     pred_npy_dir = output_dir / "pred_npy"
     pred_png_dir = output_dir / "pred_png"
+    pred_encoding_png_dir = output_dir / "pred_encoding_png"
+    gt_encoding_png_dir = output_dir / "gt_encoding_png"
     raw_npy_dir = output_dir / "raw_npy"
     vis_dir = output_dir / "vis"
     pred_npy_dir.mkdir(parents=True, exist_ok=True)
+    pred_encoding_png_dir.mkdir(parents=True, exist_ok=True)
+    gt_encoding_png_dir.mkdir(parents=True, exist_ok=True)
     if args.save_pred_png:
         pred_png_dir.mkdir(parents=True, exist_ok=True)
     if args.save_raw_outputs:
@@ -1138,6 +1188,8 @@ def run(args: argparse.Namespace) -> None:
                     resized_output_count += 1
 
                 np.save(pred_npy_dir / f"{name}.npy", pred.numpy().astype(np.float32))
+                save_polar_encoding_png(pred_encoding_png_dir / f"{name}.png", pred)
+                save_polar_encoding_png(gt_encoding_png_dir / f"{name}.png", gt)
                 if args.save_pred_png:
                     save_pred_png(pred_png_dir / f"{name}.png", pred)
 
